@@ -1,0 +1,307 @@
+import { computeLeafValues } from './decompose'
+import { utcTimeOfDaySeconds } from './timeOfDay'
+import {
+  ConditionalPrice,
+  MatchLogic,
+  ModelInfo,
+  ModelPrice,
+  ModelPriceCalculationResult,
+  PriceContext,
+  Provider,
+  ProviderFindOptions,
+  Tier,
+  TieredPrices,
+  TimeOfDateConstraint,
+  UnitDef,
+  Usage,
+} from './types'
+import { getActiveRegistry, UnitRegistry } from './units'
+import { getUsageValue, warnUnsupportedUsageKeys } from './usage'
+import { validatePricedUnits } from './validation'
+
+export type ResolvedPrice = Readonly<{
+  price: number | TieredPrices
+  unit: UnitDef
+}>
+
+export function collectResolvedModelPrices(modelPrice: ModelPrice, registry: UnitRegistry): ResolvedPrice[] {
+  const resolvedPrices: ResolvedPrice[] = []
+  const unsupportedPriceKeys: string[] = []
+  for (const [priceKey, price] of Object.entries(modelPrice)) {
+    if (price === undefined) continue
+
+    const unit = registry.getUnitForPriceKey(priceKey)
+    if (!unit) {
+      unsupportedPriceKeys.push(priceKey)
+      continue
+    }
+    resolvedPrices.push({ price: validatePriceValue(priceKey, price), unit })
+  }
+  if (unsupportedPriceKeys.length) {
+    console.warn(`Unsupported price key for standard pricing: ${unsupportedPriceKeys.sort().join(', ')}`)
+  }
+  return resolvedPrices
+}
+
+function validatePriceValue(priceKey: string, price: unknown): number | TieredPrices {
+  if (isValidPriceNumber(price)) return price
+  if (!isRecord(price) || !isValidPriceNumber(price.base) || !Array.isArray(price.tiers)) {
+    throw invalidPriceValueError(priceKey)
+  }
+
+  const tiers: Tier[] = []
+  for (const tier of price.tiers) {
+    if (!isRecord(tier)) throw invalidPriceValueError(priceKey)
+    const { price: tierPrice, start } = tier
+    if (typeof start !== 'number' || !Number.isSafeInteger(start) || start < 0 || !isValidPriceNumber(tierPrice)) {
+      throw invalidPriceValueError(priceKey)
+    }
+    tiers.push({ price: tierPrice, start })
+  }
+
+  return new TieredPrices({ base: price.base, tiers })
+}
+
+function invalidPriceValueError(priceKey: string): Error {
+  return new Error(`Invalid price value for ${priceKey}: expected a finite non-negative number or valid tiered prices`)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isValidPriceNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+}
+
+/**
+ * Calculate price using threshold-based (cliff) pricing model.
+ *
+ * When token count crosses a tier threshold, ALL tokens are charged at that tier's rate.
+ * This is the industry standard used by Anthropic, Google, OpenAI, and most other providers.
+ *
+ * Example with base=$3/MTok and tier at 200K=$6/MTok:
+ * - 199,999 tokens: all at $3/MTok = $0.599997
+ * - 200,001 tokens: all at $6/MTok = $1.200006 (cliff jump)
+ *
+ * @param tiered - Tiered pricing structure
+ * @param tokens - Number of tokens of this specific type to price
+ * @param totalInputTokens - Total input tokens for tier determination
+ */
+function calcTieredPrice(tiered: TieredPrices, tokens: number, totalInputTokens: number): number {
+  if (tokens <= 0) return 0
+
+  // Threshold-based pricing: tier is determined by totalInputTokens
+  // When totalInputTokens is 0, no tier condition is met, so base rate is used
+  let applicablePrice = tiered.base
+  for (const tier of tiered.tiers) {
+    if (totalInputTokens > tier.start) {
+      applicablePrice = tier.price
+    }
+  }
+
+  // All tokens pay the applicable rate
+  return (applicablePrice * tokens) / 1_000_000
+}
+
+function calcUnitPrice(price: number | TieredPrices | undefined, count: number | undefined, totalInputTokens: number, per: number): number {
+  if (price === undefined || count === undefined) return 0
+  if (typeof price === 'number') {
+    return (price * count) / per
+  }
+  return (calcTieredPrice(price, count, totalInputTokens) * 1_000_000) / per
+}
+
+export function calcPrice(usage: Usage, modelPrice: ModelPrice, registry: UnitRegistry = getActiveRegistry()): ModelPriceCalculationResult {
+  warnUnsupportedUsageKeys(usage, registry)
+  const resolvedPrices = collectResolvedModelPrices(modelPrice, registry)
+  validatePricedUnits(
+    resolvedPrices.map(({ unit }) => unit),
+    registry
+  )
+
+  let inputPrice = 0
+  let outputPrice = 0
+  let totalOnlyPrice = 0
+
+  const hasTieredPrice = resolvedPrices.some(({ price }) => isTieredPrice(price))
+  const totalInputTokens = hasTieredPrice ? getUsageValue(usage, 'input_tokens', registry) : 0
+  const pricedUsageKeys = new Set(resolvedPrices.filter(({ unit }) => unit.usageKey !== 'requests').map(({ unit }) => unit.usageKey))
+  const leafValues = computeLeafValues(pricedUsageKeys, usage, registry)
+  if (resolvedPrices.some(({ unit }) => unit.usageKey === 'requests')) {
+    leafValues.requests = 1
+  }
+
+  for (const { price, unit } of resolvedPrices) {
+    const unitPrice = calcUnitPrice(price, leafValues[unit.usageKey] ?? 0, totalInputTokens, unit.per)
+    if (unit.dimensions.direction === 'input') {
+      inputPrice += unitPrice
+    } else if (unit.dimensions.direction === 'output') {
+      outputPrice += unitPrice
+    } else {
+      totalOnlyPrice += unitPrice
+    }
+  }
+
+  const totalPrice = inputPrice + outputPrice + totalOnlyPrice
+
+  return {
+    input_price: inputPrice,
+    output_price: outputPrice,
+    total_price: totalPrice,
+  }
+}
+
+function isTieredPrice(price: number | TieredPrices | undefined): price is TieredPrices {
+  return typeof price === 'object'
+}
+
+function isTimeOfDateConstraint(constraint: unknown): constraint is TimeOfDateConstraint {
+  return typeof constraint === 'object' && constraint !== null && 'type' in constraint && constraint.type === 'time_of_date'
+}
+
+function constraintActive(constraint: ConditionalPrice['constraint'], timestamp: Date, modelId: string): boolean {
+  if (constraint === undefined) return true
+  if (Number.isNaN(timestamp.getTime())) throw new RangeError('Invalid time value')
+  if (constraint.type === 'start_date') return timestamp >= new Date(constraint.start_date)
+  if (!isTimeOfDateConstraint(constraint)) {
+    constraint satisfies never
+    throw new Error(`Unknown price constraint for model '${modelId}': ${JSON.stringify(constraint)}`)
+  }
+  const time =
+    timestamp.getUTCHours() * 3_600 + timestamp.getUTCMinutes() * 60 + timestamp.getUTCSeconds() + timestamp.getUTCMilliseconds() / 1_000
+  const start = utcTimeOfDaySeconds(constraint.start_time)
+  const end = utcTimeOfDaySeconds(constraint.end_time)
+  return end < start ? time >= start || time < end : time >= start && time < end
+}
+
+export function getActiveModelPrice(model: ModelInfo, timestamp: Date, priceContext?: PriceContext): ModelPrice {
+  let standard: ModelPrice
+  if (Array.isArray(model.prices)) {
+    if (Number.isNaN(timestamp.getTime())) throw new RangeError('Invalid time value')
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    standard = model.prices[0]!.prices
+    for (const candidate of [...model.prices].reverse()) {
+      if (constraintActive(candidate.constraint, timestamp, model.id)) {
+        standard = candidate.prices
+        break
+      }
+    }
+  } else {
+    standard = model.prices
+  }
+  if (!priceContext || !Object.keys(priceContext).length) return standard
+  const overrides = Object.create(null) as ModelPrice
+  for (const variant of model.price_variants ?? []) {
+    if (!constraintActive(variant.constraint, timestamp, model.id)) continue
+    if (
+      !Object.entries(variant.when).every(
+        ([key, value]) => Object.prototype.hasOwnProperty.call(priceContext, key) && priceContext[key] === value
+      )
+    )
+      continue
+    for (const [key, price] of Object.entries(variant.prices)) {
+      if (price != null && !Object.prototype.hasOwnProperty.call(overrides, key)) {
+        overrides[key] = price
+      }
+    }
+  }
+  return { ...standard, ...overrides }
+}
+
+export function matchLogic(logic: MatchLogic, text: string): boolean {
+  if ('or' in logic) {
+    return logic.or.some((clause) => matchLogic(clause, text))
+  } else if ('and' in logic) {
+    return logic.and.every((clause) => matchLogic(clause, text))
+  } else if ('equals' in logic) {
+    return text.toLowerCase() === logic.equals.toLowerCase()
+  } else if ('starts_with' in logic) {
+    return text.toLowerCase().startsWith(logic.starts_with.toLowerCase())
+  } else if ('ends_with' in logic) {
+    return text.toLowerCase().endsWith(logic.ends_with.toLowerCase())
+  } else if ('contains' in logic) {
+    return text.toLowerCase().includes(logic.contains.toLowerCase())
+  } else if ('regex' in logic) {
+    return new RegExp(logic.regex).test(text)
+  } else {
+    return false
+  }
+}
+
+function findProviderById(providers: Provider[], providerId: string): Provider | undefined {
+  const normalizedProviderId = providerId.toLowerCase().trim()
+
+  const exactMatch = providers.find((p) => p.id === normalizedProviderId)
+  if (exactMatch) return exactMatch
+
+  return providers.find((p) => p.provider_match && matchLogic(p.provider_match, normalizedProviderId))
+}
+
+export function matchProvider(providers: Provider[], { modelId, providerApiUrl, providerId }: ProviderFindOptions): Provider | undefined {
+  if (providerId) {
+    const provider = findProviderById(providers, providerId)
+    // Special case for litellm: fall back to model matching if provider not found
+    if (provider || providerId.toLowerCase() !== 'litellm') {
+      return provider
+    }
+    // Fall through to model matching for litellm
+  }
+
+  if (providerApiUrl) {
+    // Start-anchored, matching Python's `re.match`. The patterns themselves are unanchored.
+    return providers.find((p) => new RegExp(`^(?:${p.api_pattern})`).test(providerApiUrl))
+  }
+
+  if (modelId) {
+    return providers.find((p) => p.model_match && matchLogic(p.model_match, modelId))
+  }
+}
+
+export function matchModel(models: ModelInfo[], modelId: string): ModelInfo | undefined {
+  return models.find((m) => matchLogic(m.match, modelId))
+}
+
+const COMPACT_DATE_RE = /(-)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?=-|:|$)/g
+
+// Rewrite a compact date suffix like `-20251211` to the canonical `-2025-12-11` form. LiteLLM and
+// OpenRouter emit compact dated model refs (e.g. `gpt-5.2-20251211`) that don't match the dashed
+// aliases in the price data. Only used as a fallback, so models that match on the compact date form
+// are left untouched.
+export function normalizeCompactDatedRef(modelId: string): string {
+  return modelId.replace(COMPACT_DATE_RE, (match, prefix: string, year: string, month: string, day: string) => {
+    const parsed = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)))
+    if (parsed.getUTCFullYear() !== Number(year) || parsed.getUTCMonth() !== Number(month) - 1 || parsed.getUTCDate() !== Number(day)) {
+      return match
+    }
+    return `${prefix}${year}-${month}-${day}`
+  })
+}
+
+export function matchModelWithFallback(provider: Provider, modelId: string, allProviders?: Provider[]): ModelInfo | undefined {
+  const model = matchModelDirect(provider, modelId, allProviders)
+  if (model) return model
+
+  // LiteLLM/OpenRouter emit compact dated refs like `gpt-5.2-20251211`; retry with the canonical
+  // dashed form if the ref didn't match as-is.
+  const normalized = normalizeCompactDatedRef(modelId)
+  if (normalized !== modelId) return matchModelDirect(provider, normalized, allProviders)
+  return undefined
+}
+
+function matchModelDirect(provider: Provider, modelId: string, allProviders?: Provider[]): ModelInfo | undefined {
+  const model = matchModel(provider.models, modelId)
+  if (model) return model
+
+  if (provider.fallback_model_providers && allProviders) {
+    for (const fallbackProviderId of provider.fallback_model_providers) {
+      const fallbackProvider = allProviders.find((p) => p.id === fallbackProviderId)
+      if (fallbackProvider) {
+        // don't pass allProviders when falling back, so we can only have one step of fallback
+        const fallbackModel = matchModelDirect(fallbackProvider, modelId)
+        if (fallbackModel) return fallbackModel
+      }
+    }
+  }
+  return undefined
+}
